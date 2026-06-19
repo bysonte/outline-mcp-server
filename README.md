@@ -196,6 +196,41 @@ En Windows, usa una ruta absoluta válida, por ejemplo:
 "args": ["D:/work/outline-mcp-server/dist/index.js"]
 ```
 
+### OpenCode
+
+OpenCode usa una forma de configuración distinta a otros clientes MCP: el comando va como un array único y las variables del proceso van en `environment`, no en `env`.
+
+Ejemplo para `C:\Users\gbaso\.config\opencode\opencode.json`:
+
+```json
+{
+  "mcp": {
+    "outline": {
+      "type": "local",
+      "command": [
+        "node",
+        "D:/work/outline-mcp-server/dist/index.js"
+      ],
+      "enabled": true,
+      "environment": {
+        "OUTLINE_BASE_URL": "https://tu-instancia-outline.com",
+        "OUTLINE_API_KEY": "tu-token-de-api"
+      }
+    }
+  }
+}
+```
+
+Si usas `env` en OpenCode, el servidor puede arrancar sin `OUTLINE_BASE_URL` y `OUTLINE_API_KEY`, fallar al inicio y aparecer en logs como `server unavailable key=outline type=local status=failed`.
+
+Los logs de OpenCode en Windows están en:
+
+```text
+C:\Users\gbaso\.local\share\opencode\log\opencode.log
+```
+
+Después de modificar `opencode.json`, reinicia OpenCode. La configuración de MCP se carga al inicio y no se recarga en caliente.
+
 ## Herramientas Disponibles
 
 ### `outline_get_document`
