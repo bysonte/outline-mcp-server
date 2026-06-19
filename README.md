@@ -23,7 +23,10 @@ Casos de uso típicos:
 - Eliminación de documentos.
 - Listado de colecciones.
 - Consulta de información de una colección concreta.
-- Transporte MCP por `stdio`, ideal para clientes locales.
+- Transporte MCP por `stdio` por defecto, ideal para clientes locales.
+- Transporte Streamable HTTP opcional para despliegues remotos.
+- Modo solo lectura para ocultar herramientas de escritura.
+- Timeout HTTP y reintentos acotados ante errores temporales de Outline.
 - Validación de argumentos con esquemas Zod mediante el SDK MCP actual.
 
 ## Requisitos
@@ -78,9 +81,60 @@ El servidor lee la configuración desde variables de entorno:
 ```bash
 OUTLINE_BASE_URL=https://tu-instancia-outline.com
 OUTLINE_API_KEY=tu-token-de-api
+OUTLINE_READ_ONLY=false
+MCP_TRANSPORT=stdio
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=3000
+MCP_HTTP_PATH=/mcp
+OUTLINE_MAX_RETRIES=2
+OUTLINE_RETRY_BASE_DELAY_MS=100
+# OUTLINE_HTTP_TIMEOUT_MS=10000
 ```
 
 Puedes tomar `env.example` como referencia.
+
+Variables disponibles:
+
+| Variable | Default | Descripción |
+| --- | --- | --- |
+| `OUTLINE_BASE_URL` | requerido | URL base de tu instancia de Outline. |
+| `OUTLINE_API_KEY` | requerido | Token de API de Outline. No se imprime en logs. |
+| `OUTLINE_READ_ONLY` | `false` | Si es `true`, no registra `outline_create_document`, `outline_update_document` ni `outline_delete_document`. |
+| `MCP_TRANSPORT` | `stdio` | Transporte MCP: `stdio` o `http`. Valores inválidos fallan al arrancar. |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Host de escucha para Streamable HTTP. Usa `0.0.0.0` solo si el despliegue lo protege correctamente. |
+| `MCP_HTTP_PORT` | `3000` | Puerto HTTP cuando `MCP_TRANSPORT=http`. |
+| `MCP_HTTP_PATH` | `/mcp` | Path HTTP del endpoint MCP. Debe empezar con `/`. |
+| `OUTLINE_MAX_RETRIES` | `2` | Reintentos máximos por endpoint para `429`, `5xx` y errores transitorios de red. Usa `0` para desactivar. |
+| `OUTLINE_RETRY_BASE_DELAY_MS` | `100` | Delay base para backoff acotado entre reintentos. |
+| `OUTLINE_HTTP_TIMEOUT_MS` | sin valor | Timeout opcional en milisegundos para Axios. |
+
+### Modo Solo Lectura
+
+Con `OUTLINE_READ_ONLY=true`, el servidor no expone las herramientas de escritura en `tools/list`. Las herramientas ocultas son `outline_create_document`, `outline_update_document` y `outline_delete_document`.
+
+Aunque actives este modo, usa también un token de Outline con permisos mínimos de lectura siempre que tu instancia lo permita.
+
+### Transporte Streamable HTTP
+
+`stdio` sigue siendo el transporte por defecto y no requiere configurar variables HTTP. Para exponer el servidor por Streamable HTTP:
+
+```bash
+MCP_TRANSPORT=http
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=3000
+MCP_HTTP_PATH=/mcp
+npm start
+```
+
+El endpoint queda disponible en `http://127.0.0.1:3000/mcp` con transporte Streamable HTTP del SDK MCP. Si necesitas exponerlo fuera de la máquina local, cambia `MCP_HTTP_HOST`, por ejemplo a `0.0.0.0`, y protege el acceso desde la red o un proxy.
+
+Este cambio no agrega autenticación propia al endpoint HTTP. En producción, publícalo solo detrás de una red confiable, VPN, reverse proxy con autenticación, reglas de firewall o controles equivalentes.
+
+### Timeout Y Reintentos
+
+El cliente de Outline puede reintentar errores temporales: `429`, `500`, `502`, `503`, `504`, `ECONNRESET`, `ETIMEDOUT` y `ECONNABORTED`. No reintenta errores permanentes como `400`, `401` o `403`.
+
+Configura `OUTLINE_MAX_RETRIES=0` para desactivar reintentos. Define `OUTLINE_HTTP_TIMEOUT_MS` solo si quieres imponer un timeout explícito a las llamadas HTTP hacia Outline.
 
 ### Cómo Obtener El Token De Outline
 
@@ -265,6 +319,8 @@ src/
 Scripts disponibles:
 
 - `npm run build`: compila TypeScript en `dist/`.
+- `npm test`: ejecuta la suite Vitest sin credenciales reales de Outline.
+- `npm run test:coverage`: ejecuta tests con cobertura global mínima del 85%.
 - `npm start`: ejecuta `dist/index.js`.
 - `npm run dev`: compila y ejecuta el servidor.
 - `npm run watch`: recompila al detectar cambios.
@@ -275,13 +331,13 @@ Scripts disponibles:
 - Usa variables de entorno o el sistema de secretos de tu cliente MCP.
 - Evita tokens con permisos excesivos si el cliente solo necesita lectura.
 - Ten cuidado con herramientas de escritura o borrado: el servidor puede modificar tu instancia de Outline.
+- Si usas `MCP_TRANSPORT=http`, protege el endpoint con controles externos; el servidor no implementa autenticación HTTP propia.
 
 ## Limitaciones Actuales
 
 - No implementa rate limiting interno; si haces muchas llamadas, depende de los límites de Outline.
-- Las respuestas de Outline se devuelven como JSON sin normalización de dominio propia.
-- No hay suite de tests automatizada incluida.
-- El transporte disponible es `stdio`; no expone Streamable HTTP para uso remoto.
+- Las respuestas de Outline se devuelven como JSON de la API, con tipos TypeScript pragmáticos pero sin validación runtime exhaustiva de cada campo.
+- El transporte HTTP es stateless; no agrega sesiones persistentes ni autenticación propia.
 
 ## Licencia
 

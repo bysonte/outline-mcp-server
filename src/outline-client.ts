@@ -1,11 +1,17 @@
 import axios, { AxiosError, AxiosInstance } from 'axios';
+import type { OutlineCollection, OutlineDocument, OutlineListResponse, OutlineSearchResult } from './outline-types.js';
 
-export type Document = unknown;
-export type Collection = unknown;
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_RETRY_BASE_DELAY_MS = 100;
+const TEMPORARY_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const TEMPORARY_ERROR_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED']);
 
 export interface OutlineConfig {
   apiKey: string;
   baseUrl: string;
+  timeoutMs?: number;
+  maxRetries?: number;
+  retryBaseDelayMs?: number;
 }
 
 interface CreateDocumentInput {
@@ -26,29 +32,36 @@ type JsonPayload = Record<string, unknown>;
 
 export class OutlineClient {
   private readonly api: AxiosInstance;
+  private readonly maxRetries: number;
+  private readonly retryBaseDelayMs: number;
 
   constructor(config: OutlineConfig) {
-    this.api = axios.create({
+    const axiosConfig = {
       baseURL: config.baseUrl,
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json',
       },
-    });
+      ...(config.timeoutMs !== undefined && config.timeoutMs > 0 ? { timeout: config.timeoutMs } : {}),
+    };
+
+    this.api = axios.create(axiosConfig);
+    this.maxRetries = Math.max(0, Math.floor(config.maxRetries ?? DEFAULT_MAX_RETRIES));
+    this.retryBaseDelayMs = Math.max(0, Math.floor(config.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS));
   }
 
-  async getDocument(id: string): Promise<Document> {
+  async getDocument(id: string): Promise<OutlineDocument> {
     return this.postFirst(['/api/documents.info', '/api/documents/info', '/api/document/info'], { id });
   }
 
-  async searchDocuments(query: string, limit = 25): Promise<Document> {
+  async searchDocuments(query: string, limit = 25): Promise<OutlineListResponse<OutlineSearchResult>> {
     return this.postFirst(['/api/documents.search', '/api/documents/search', '/api/document/search'], {
       query,
       limit,
     });
   }
 
-  async listDocuments(collectionId?: string, limit = 25): Promise<Document> {
+  async listDocuments(collectionId?: string, limit = 25): Promise<OutlineListResponse<OutlineDocument>> {
     const payload: JsonPayload = { limit };
 
     if (collectionId) {
@@ -58,7 +71,7 @@ export class OutlineClient {
     return this.postFirst(['/api/documents.list', '/api/documents/list', '/api/documents', '/api/document/list'], payload);
   }
 
-  async createDocument(data: CreateDocumentInput): Promise<Document> {
+  async createDocument(data: CreateDocumentInput): Promise<OutlineDocument> {
     const payload: JsonPayload = {
       title: data.title,
       text: data.text,
@@ -76,7 +89,7 @@ export class OutlineClient {
     return this.postFirst(['/api/documents.create', '/api/documents/create', '/api/documents', '/api/document/create'], payload);
   }
 
-  async updateDocument(id: string, data: UpdateDocumentInput): Promise<Document> {
+  async updateDocument(id: string, data: UpdateDocumentInput): Promise<OutlineDocument> {
     const payload: JsonPayload = { id };
 
     if (data.title !== undefined) {
@@ -98,41 +111,68 @@ export class OutlineClient {
     await this.postFirst(['/api/documents.delete', '/api/documents/delete', '/api/document/delete'], { id });
   }
 
-  async getCollections(): Promise<Collection> {
+  async getCollections(): Promise<OutlineListResponse<OutlineCollection>> {
     return this.postFirst(['/api/collections.list', '/api/collections/list', '/api/collections', '/api/collection/list'], {});
   }
 
-  async getCollection(id: string): Promise<Collection> {
+  async getCollection(id: string): Promise<OutlineCollection> {
     return this.postFirst(['/api/collections.info', '/api/collections/info', '/api/collection/info'], { id });
   }
 
-  private async postFirst(endpoints: string[], payload: JsonPayload): Promise<unknown> {
+  private async postFirst<T>(endpoints: string[], payload: JsonPayload): Promise<T> {
     for (const [index, endpoint] of endpoints.entries()) {
-      try {
-        const response = await this.api.post(endpoint, payload);
-        return this.extractData(response.data);
-      } catch (error) {
-        if (this.shouldTryNextEndpoint(error, endpoints, index)) {
-          continue;
-        }
+      for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+        try {
+          const response = await this.api.post(endpoint, payload);
+          return this.extractData<T>(response.data);
+        } catch (error) {
+          if (this.shouldTryNextEndpoint(error, endpoints, index)) {
+            break;
+          }
 
-        throw this.toReadableError(error);
+          if (attempt < this.maxRetries && this.isTemporaryError(error)) {
+            await this.delay(this.retryBaseDelayMs * (attempt + 1));
+            continue;
+          }
+
+          throw this.toReadableError(error);
+        }
       }
     }
 
     throw new Error('No valid Outline API endpoint found');
   }
 
-  private extractData(responseData: unknown): unknown {
+  private extractData<T>(responseData: unknown): T {
     if (this.isObject(responseData) && 'data' in responseData) {
-      return responseData.data;
+      return responseData.data as T;
     }
 
-    return responseData;
+    return responseData as T;
   }
 
   private shouldTryNextEndpoint(error: unknown, endpoints: string[], currentIndex: number): boolean {
     return error instanceof AxiosError && error.response?.status === 404 && currentIndex < endpoints.length - 1;
+  }
+
+  private isTemporaryError(error: unknown): boolean {
+    if (!(error instanceof AxiosError)) {
+      return false;
+    }
+
+    const status = error.response?.status;
+
+    return (status !== undefined && TEMPORARY_STATUS_CODES.has(status)) || (error.code !== undefined && TEMPORARY_ERROR_CODES.has(error.code));
+  }
+
+  private async delay(milliseconds: number): Promise<void> {
+    if (milliseconds <= 0) {
+      return;
+    }
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, milliseconds);
+    });
   }
 
   private toReadableError(error: unknown): Error {

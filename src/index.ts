@@ -1,8 +1,29 @@
 #!/usr/bin/env node
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { OutlineClient } from './outline-client.js';
+import { OutlineClient, type OutlineConfig } from './outline-client.js';
+
+export interface OutlineMcpServerOptions {
+  readOnly?: boolean;
+}
+
+export interface RuntimeConfig extends OutlineConfig {
+  readOnly: boolean;
+  transport: 'stdio' | 'http';
+  httpHost: string;
+  httpPort: number;
+  httpPath: string;
+}
+
+export interface HttpTransportConfig {
+  httpHost: string;
+  httpPort: number;
+  httpPath: string;
+}
 
 function toTextContent(data: unknown) {
   return {
@@ -27,9 +48,13 @@ function toErrorContent(error: unknown) {
 class OutlineMCPServer {
   private readonly server: McpServer;
   private readonly outlineClient: OutlineClient;
+  private readonly options: Required<OutlineMcpServerOptions>;
 
-  constructor(outlineClient: OutlineClient) {
+  constructor(outlineClient: OutlineClient, options: OutlineMcpServerOptions = {}) {
     this.outlineClient = outlineClient;
+    this.options = {
+      readOnly: options.readOnly ?? false,
+    };
     this.server = new McpServer({
       name: 'outline-mcp-server',
       version: '1.0.0',
@@ -95,6 +120,45 @@ class OutlineMCPServer {
       }
     );
 
+    if (!this.options.readOnly) {
+      this.registerWriteTools();
+    }
+
+    this.server.registerTool(
+      'outline_list_collections',
+      {
+        title: 'Listar colecciones de Outline',
+        description: 'Lista todas las colecciones disponibles en Outline.',
+      },
+      async () => {
+        try {
+          return toTextContent(await this.outlineClient.getCollections());
+        } catch (error) {
+          return toErrorContent(error);
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'outline_get_collection',
+      {
+        title: 'Obtener colección de Outline',
+        description: 'Obtiene información de una colección concreta de Outline.',
+        inputSchema: {
+          id: z.string().min(1).describe('ID de la colección a recuperar'),
+        },
+      },
+      async ({ id }) => {
+        try {
+          return toTextContent(await this.outlineClient.getCollection(id));
+        } catch (error) {
+          return toErrorContent(error);
+        }
+      }
+    );
+  }
+
+  private registerWriteTools() {
     this.server.registerTool(
       'outline_create_document',
       {
@@ -164,49 +228,22 @@ class OutlineMCPServer {
         }
       }
     );
+  }
 
-    this.server.registerTool(
-      'outline_list_collections',
-      {
-        title: 'Listar colecciones de Outline',
-        description: 'Lista todas las colecciones disponibles en Outline.',
-      },
-      async () => {
-        try {
-          return toTextContent(await this.outlineClient.getCollections());
-        } catch (error) {
-          return toErrorContent(error);
-        }
-      }
-    );
-
-    this.server.registerTool(
-      'outline_get_collection',
-      {
-        title: 'Obtener colección de Outline',
-        description: 'Obtiene información de una colección concreta de Outline.',
-        inputSchema: {
-          id: z.string().min(1).describe('ID de la colección a recuperar'),
-        },
-      },
-      async ({ id }) => {
-        try {
-          return toTextContent(await this.outlineClient.getCollection(id));
-        } catch (error) {
-          return toErrorContent(error);
-        }
-      }
-    );
+  getMcpServer() {
+    return this.server;
   }
 
   async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('Outline MCP Server running on stdio');
+    await runStdioServer(this.server);
   }
 }
 
-function getRequiredEnv(name: string) {
+export function createOutlineMcpServer(outlineClient: OutlineClient, options: OutlineMcpServerOptions = {}) {
+  return new OutlineMCPServer(outlineClient, options).getMcpServer();
+}
+
+export function getRequiredEnv(name: string) {
   const value = process.env[name];
 
   if (!value) {
@@ -216,13 +253,152 @@ function getRequiredEnv(name: string) {
   return value;
 }
 
-const outlineClient = new OutlineClient({
-  apiKey: getRequiredEnv('OUTLINE_API_KEY'),
-  baseUrl: getRequiredEnv('OUTLINE_BASE_URL'),
-});
+export function parseRuntimeConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
+  return {
+    apiKey: getRequiredEnvFrom(env, 'OUTLINE_API_KEY'),
+    baseUrl: getRequiredEnvFrom(env, 'OUTLINE_BASE_URL'),
+    readOnly: parseBooleanEnv(env.OUTLINE_READ_ONLY),
+    transport: parseTransportEnv(env.MCP_TRANSPORT),
+    httpHost: env.MCP_HTTP_HOST || '127.0.0.1',
+    httpPort: parseOptionalIntegerEnv(env.MCP_HTTP_PORT, 'MCP_HTTP_PORT', { minimum: 1 }) ?? 3000,
+    httpPath: parseHttpPathEnv(env.MCP_HTTP_PATH),
+    maxRetries: parseOptionalIntegerEnv(env.OUTLINE_MAX_RETRIES, 'OUTLINE_MAX_RETRIES', { minimum: 0 }),
+    retryBaseDelayMs: parseOptionalIntegerEnv(env.OUTLINE_RETRY_BASE_DELAY_MS, 'OUTLINE_RETRY_BASE_DELAY_MS', { minimum: 0 }),
+    timeoutMs: parseOptionalIntegerEnv(env.OUTLINE_HTTP_TIMEOUT_MS, 'OUTLINE_HTTP_TIMEOUT_MS', { minimum: 1 }),
+  };
+}
 
-const server = new OutlineMCPServer(outlineClient);
-server.run().catch((error) => {
-  console.error('Server error:', error);
-  process.exit(1);
-});
+export function buildServerFromEnv(env: NodeJS.ProcessEnv = process.env) {
+  const config = parseRuntimeConfig(env);
+  const outlineClient = new OutlineClient(config);
+
+  return new OutlineMCPServer(outlineClient, { readOnly: config.readOnly });
+}
+
+export async function runServerFromEnv(env: NodeJS.ProcessEnv = process.env) {
+  const config = parseRuntimeConfig(env);
+  const outlineClient = new OutlineClient(config);
+  const server = createOutlineMcpServer(outlineClient, { readOnly: config.readOnly });
+
+  if (config.transport === 'http') {
+    return startHttpServer(server, config);
+  }
+
+  await runStdioServer(server);
+  return undefined;
+}
+
+export async function runStdioServer(server: McpServer) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Outline MCP Server running on stdio');
+}
+
+export async function startHttpServer(server: McpServer, config: HttpTransportConfig): Promise<HttpServer> {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  await server.connect(transport);
+
+  const httpServer = createServer((req, res) => {
+    handleHttpTransportRequest(req, res, config.httpPath, transport).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : 'Unknown HTTP transport error';
+      console.error('HTTP transport error:', message);
+
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'text/plain' });
+      }
+
+      res.end('Internal server error');
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(config.httpPort, config.httpHost, () => {
+      httpServer.off('error', reject);
+      resolve();
+    });
+  });
+
+  console.error(`Outline MCP Server running on HTTP at http://${config.httpHost}:${config.httpPort}${config.httpPath}`);
+  return httpServer;
+}
+
+export async function handleHttpTransportRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  httpPath: string,
+  transport: StreamableHTTPServerTransport
+) {
+  const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+  if (requestUrl.pathname !== httpPath) {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('Not found');
+    return;
+  }
+
+  await transport.handleRequest(req, res);
+}
+
+function getRequiredEnvFrom(env: NodeJS.ProcessEnv, name: string) {
+  const value = env[name];
+
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+
+  return value;
+}
+
+function parseBooleanEnv(value: string | undefined) {
+  return value?.toLowerCase() === 'true';
+}
+
+function parseTransportEnv(value: string | undefined): RuntimeConfig['transport'] {
+  const transport = value ?? 'stdio';
+
+  if (transport === 'stdio' || transport === 'http') {
+    return transport;
+  }
+
+  throw new Error('MCP_TRANSPORT must be either stdio or http');
+}
+
+function parseHttpPathEnv(value: string | undefined) {
+  if (!value) {
+    return '/mcp';
+  }
+
+  if (!value.startsWith('/')) {
+    throw new Error('MCP_HTTP_PATH must start with /');
+  }
+
+  return value;
+}
+
+interface IntegerEnvOptions {
+  minimum: number;
+}
+
+function parseOptionalIntegerEnv(value: string | undefined, name: string, options: IntegerEnvOptions) {
+  if (value === undefined || value === '') {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed < options.minimum) {
+    throw new Error(`${name} must be an integer greater than or equal to ${options.minimum}`);
+  }
+
+  return parsed;
+}
+
+const isCliEntryPoint = process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isCliEntryPoint) {
+  runServerFromEnv().catch((error) => {
+    console.error('Server error:', error);
+    process.exit(1);
+  });
+}
